@@ -1,0 +1,17 @@
+# Build artifacts
+build/
+dist/
+*.exe
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs output
+logs_*/
+output/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -38,6 +38,70 @@ def is_recent_bjt_date(date_str):
     yesterday = today - timedelta(days=1)
     return file_date in {today, yesterday}
 
+def pull_private_dir(pkg, remote_dir, dest_dir):
+    """拉取 app 私有目录下的所有文件（/data/user/0/<pkg>/files/mmkv 等）。
+    返回成功拉取的文件数。依次尝试 root 直拉 / run-as / su 。
+    """
+    # 先列出目录下的文件名（优先 root ls，其次 run-as ls）
+    names = []
+    out, code = run_cmd(f'adb shell "ls -1 {remote_dir} 2>/dev/null"')
+    if code == 0 and out:
+        names = [l.strip() for l in out.split("\n") if l.strip()]
+    if not names:
+        rel = remote_dir.split(f"/{pkg}/", 1)[-1]  # files/mmkv
+        out, code = run_cmd(f'adb shell "run-as {pkg} ls -1 {rel} 2>/dev/null"')
+        if code == 0 and out:
+            names = [l.strip() for l in out.split("\n") if l.strip()]
+    if not names:
+        return 0
+
+    count = 0
+    for name in names:
+        remote = f"{remote_dir}/{name}"
+        dest = os.path.join(dest_dir, name)
+        if pull_private_file(pkg, remote, dest):
+            count += 1
+            print(f"    [OK] {name}")
+        else:
+            print(f"    [X]  {name}")
+    return count
+
+
+def pull_private_file(pkg, remote, dest):
+    """拉取 app 私有目录文件（/data/user/0/<pkg>/...）。
+    普通 adb pull 无权限，依次尝试：
+      1) root 直拉（adb root 后 adb pull）
+      2) run-as <pkg> + cat 重定向到 /sdcard 再 pull（debuggable 包可用）
+      3) su -c cat 重定向（已 root 但未 adb root）
+    成功返回 True。
+    """
+    # 方式1：root 直拉
+    _, code = run_cmd(f'adb pull "{remote}" "{dest}"')
+    if code == 0 and os.path.exists(dest):
+        return True
+
+    tmp_remote = f"/sdcard/_mmkv_pull_tmp"
+
+    # 方式2：run-as（仅 debuggable 包，工作目录为 app 私有根）
+    rel = remote.split(f"/{pkg}/", 1)[-1]  # files/mmkv/mmkv.default
+    _, c1 = run_cmd(f'adb shell "run-as {pkg} cat {rel} > {tmp_remote}"')
+    if c1 == 0:
+        _, c2 = run_cmd(f'adb pull "{tmp_remote}" "{dest}"')
+        run_cmd(f'adb shell "rm -f {tmp_remote}"')
+        if c2 == 0 and os.path.exists(dest):
+            return True
+
+    # 方式3：su -c cat
+    _, c3 = run_cmd(f'adb shell "su -c \'cat {remote}\' > {tmp_remote}"')
+    if c3 == 0:
+        _, c4 = run_cmd(f'adb pull "{tmp_remote}" "{dest}"')
+        run_cmd(f'adb shell "rm -f {tmp_remote}"')
+        if c4 == 0 and os.path.exists(dest):
+            return True
+
+    return False
+
+
 def parse_ls_line(line):
     """解析 adb shell ls -l 输出，提取日期和文件名"""
     line = line.strip()
@@ -76,11 +140,12 @@ def main():
     # Create directories
     os.makedirs(base_dir, exist_ok=True)
     system_logd_dir = os.path.join(base_dir, "system_logd")
-    # switchbot_dir = os.path.join(base_dir, "switchbot_log")
-    os.makedirs(system_logd_dir, exist_ok=True)
-    # os.makedirs(switchbot_dir, exist_ok=True)
-    
+    switchbot_dir = os.path.join(base_dir, "switchbot_log")
+    mmkv_dir = os.path.join(base_dir, "mmkv")
     anr_dir = os.path.join(base_dir, "anr")
+    os.makedirs(system_logd_dir, exist_ok=True)
+    os.makedirs(switchbot_dir, exist_ok=True)
+    os.makedirs(mmkv_dir, exist_ok=True)
     os.makedirs(anr_dir, exist_ok=True)
     
     print(f"[OK] Created: {base_dir}")
@@ -115,37 +180,61 @@ def main():
     
     print()
     
-    # 2. Pull SwitchBot logs (暂时不需要，已注释)
-    # print("=" * 50)
-    # print("2. Pulling SwitchBot App Logs (/data/local/switchbot/log/)")
-    # print("=" * 50)
-    # 
-    # cmd = 'adb shell "ls -l /data/local/switchbot/log/"'
-    # files, _ = run_cmd(cmd)
-    # if files:
-    #     for line in files.split('\n'):
-    #         file_date, file = parse_ls_line(line)
-    #         if not file:
-    #             continue
-    #         if not all_logs and not is_recent_bjt_date(file_date):
-    #             print(f"Skipping old file: {file} ({file_date})")
-    #             continue
-    #
-    #         print(f"Pulling: /data/local/switchbot/log/{file} ({file_date})")
-    #         cmd = f'adb pull "/data/local/switchbot/log/{file}" "{switchbot_dir}\\{file}"'
-    #         _, code = run_cmd(cmd)
-    #         if code == 0:
-    #             print(f"  [OK] Success: {file}")
-    #         else:
-    #             print(f"  [X] Failed: {file}")
+    # 2. Pull SwitchBot logs
+    print("=" * 50)
+    print("2. Pulling SwitchBot App Logs (/data/local/switchbot/log/)")
+    print("=" * 50)
+    
+    cmd = 'adb shell "ls -l /data/local/switchbot/log/"'
+    files, _ = run_cmd(cmd)
+    if files:
+        for line in files.split('\n'):
+            file_date, file = parse_ls_line(line)
+            if not file:
+                continue
+            if not all_logs and not is_recent_bjt_date(file_date):
+                print(f"Skipping old file: {file} ({file_date})")
+                continue
+
+            print(f"Pulling: /data/local/switchbot/log/{file} ({file_date})")
+            cmd = f'adb pull "/data/local/switchbot/log/{file}" "{switchbot_dir}\\{file}"'
+            _, code = run_cmd(cmd)
+            if code == 0:
+                print(f"  [OK] Success: {file}")
+            else:
+                print(f"  [X] Failed: {file}")
     
     print()
-    
-    # 3. Pull ANR traces (/data/anr/)
+
+    # 3. Pull MMKV config files (app private dirs, whole mmkv/ folder)
     print("=" * 50)
-    print("3. Pulling ANR Traces (/data/anr/)")
+    print("3. Pulling MMKV Config Files (app private data)")
     print("=" * 50)
-    
+
+    mmkv_pkgs = ["com.theswitchbot.aihub", "com.theswitchbot.central"]
+    for pkg in mmkv_pkgs:
+        remote_dir = f"/data/user/0/{pkg}/files/mmkv"
+        dest_dir = os.path.join(mmkv_dir, pkg)
+        os.makedirs(dest_dir, exist_ok=True)
+        print(f"Pulling: {remote_dir}/")
+        n = pull_private_dir(pkg, remote_dir, dest_dir)
+        if n > 0:
+            print(f"  [OK] Success: {pkg} ({n} files)")
+        else:
+            print(f"  [X] Failed: {pkg} (no root / run-as not permitted? or empty dir)")
+            # 未拉到数据时写提示文件
+            readme = os.path.join(dest_dir, "_NO_MMKV_FOUND.txt")
+            with open(readme, 'w', encoding='utf-8') as f:
+                f.write(f"检查时间: {get_bjt_now().strftime('%Y-%m-%d %H:%M:%S')} (BJT)\n")
+                f.write(f"未能拉取 {remote_dir} （设备未 root / 该目录不存在 / 包未安装）\n")
+            print(f"  [INFO] created _NO_MMKV_FOUND.txt placeholder for {pkg}")
+    print()
+
+    # 4. Pull ANR traces (/data/anr/)
+    print("=" * 50)
+    print("4. Pulling ANR Traces (/data/anr/)")
+    print("=" * 50)
+
     # ANR 目录需要 root 权限
     root_out, root_code = run_cmd('adb root')
     if root_code == 0:
@@ -154,12 +243,10 @@ def main():
             # adb root 会重启 adbd，等待设备重连
             print("  Waiting for device reconnect...")
             run_cmd('adb wait-for-device')
-        
-        run_cmd('adb remount')
-        
+
         cmd = 'adb shell "ls -la /data/anr/"'
         anr_files, anr_code = run_cmd(cmd)
-        
+
         if anr_code != 0 or not anr_files or "No such file" in anr_files:
             print("  [INFO] /data/anr/ does not exist or is empty - no ANR traces")
         else:
@@ -174,7 +261,7 @@ def main():
                 fname = parts[-1]
                 if fname in ('.', '..'):
                     continue
-                
+
                 remote = f"/data/anr/{fname}"
                 local = os.path.join(anr_dir, fname)
                 print(f"Pulling: {remote}")
@@ -184,28 +271,26 @@ def main():
                     pulled += 1
                 else:
                     print(f"  [X] Failed: {fname}")
-            
+
             if pulled == 0:
                 print("  [INFO] No ANR files pulled")
             else:
                 print(f"  [OK] Pulled {pulled} ANR file(s)")
     else:
         print(f"  [WARN] adb root failed ({root_out}) - skipping ANR collection")
-    
+
     # 保留 anr 目录，即使为空也给用户提示
     if not os.listdir(anr_dir):
-        # 写一个提示文件，说明查过但没有 ANR
         readme = os.path.join(anr_dir, "_NO_ANR_FOUND.txt")
         with open(readme, 'w', encoding='utf-8') as f:
             f.write(f"检查时间: {get_bjt_now().strftime('%Y-%m-%d %H:%M:%S')} (BJT)\n")
             f.write("设备 /data/anr/ 目录为空，当前没有 ANR 记录\n")
         print("  [INFO] No ANR files found, created _NO_ANR_FOUND.txt as placeholder")
-    
     print()
-    
-    # 4. Create compressed version
+
+    # 5. Create compressed version
     print("=" * 50)
-    print("4. Creating Compressed Archive")
+    print("5. Creating Compressed Archive")
     print("=" * 50)
     
     zip_name = f"logs_{timestamp}"

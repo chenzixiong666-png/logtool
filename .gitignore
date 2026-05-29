@@ -15,3 +15,5 @@ output/
 # OS
 .DS_Store
 Thumbs.db
+
+anr_files/bugreport.zip
